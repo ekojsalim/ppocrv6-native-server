@@ -77,16 +77,18 @@ pub(super) async fn info(State(state): State<AppState>) -> Result<Json<Value>, A
 
 pub(super) async fn recognize(
     State(state): State<AppState>,
+    Extension(context): Extension<RequestContext>,
     Json(payload): Json<LineRequest>,
 ) -> Result<Json<Value>, ApiError> {
     let worker = state.lines;
-    let permit = timeout(state.queue_timeout, state.semaphore.acquire_owned())
-        .await
+    let queued = Instant::now();
+    let permit = timeout(state.queue_timeout, state.semaphore.acquire_owned()).await;
+    context.set("queue_ms", json!(queued.elapsed().as_secs_f64() * 1000.0));
+    let permit = permit
         .map_err(|_| ApiError::unavailable("line recognition queue timeout"))?
         .map_err(|_| ApiError::unavailable("recognition worker is closed"))?;
     let result = tokio::task::spawn_blocking(move || {
-        let _permit = permit;
-        recognize_blocking(&worker, payload)
+        recognize_blocking(&worker, payload, &context, &state.diagnostics, permit)
     })
     .await
     .map_err(|e| ApiError::internal(format!("line recognition task failed: {e}")))??;
@@ -149,7 +151,13 @@ fn decode_line_image(raw: &[u8], remaining_pixels: u64) -> Result<RgbImage, ApiE
     decode_image(raw, remaining_pixels)
 }
 
-fn recognize_blocking(worker: &LineWorker, payload: LineRequest) -> Result<Value, ApiError> {
+fn recognize_blocking(
+    worker: &LineWorker,
+    payload: LineRequest,
+    context: &RequestContext,
+    diagnostics: &diagnostics::Diagnostics,
+    permit: tokio::sync::OwnedSemaphorePermit,
+) -> Result<Value, ApiError> {
     let started = Instant::now();
     let single = payload.image.is_some() && payload.images.is_none();
     let images = extract_images(payload.image, payload.images, worker.max_images)?;
@@ -236,6 +244,8 @@ fn recognize_blocking(worker: &LineWorker, payload: LineRequest) -> Result<Value
             chunks.push(json!({"batch": chunk.len(), "width": bucket}));
         }
     }
+    drop(recognizer);
+    drop(permit);
     let mut result = json!({"count": count, "predictions": predictions,
         "recognition_chunks": chunks, "character_policy": "all", "score_mode": "model",
         "timing": {"decode_ms": preprocess_ms, "resize_ms": resize_ms,
@@ -244,6 +254,13 @@ fn recognize_blocking(worker: &LineWorker, payload: LineRequest) -> Result<Value
     if single {
         result["prediction"] = result["predictions"][0].clone();
     }
+    diagnostics.observe(
+        context,
+        "line",
+        &images,
+        &result,
+        json!({"batch_size":batch}),
+    );
     Ok(result)
 }
 

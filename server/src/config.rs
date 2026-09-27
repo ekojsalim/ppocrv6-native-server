@@ -8,6 +8,16 @@ use std::path::PathBuf;
     about = "Native CUDA PP-OCRv6 server: pages, lines, and glyphs"
 )]
 pub(crate) struct Cli {
+    /// Structured stderr log verbosity (health checks require debug).
+    #[arg(long, value_enum, default_value_t = crate::observability::LogLevel::Info)]
+    pub(crate) log_level: crate::observability::LogLevel,
+    /// Opt-in storage for empty/recovered OCR inputs and result metadata.
+    #[arg(long)]
+    pub(crate) diagnostics_dir: Option<PathBuf>,
+    /// Disk budget for retained diagnostic cases (oldest cases are removed).
+    #[arg(long, default_value_t = 256, value_parser = clap::value_parser!(u32).range(1..=65536))]
+    pub(crate) diagnostics_max_mib: u32,
+
     /// Compiled model bundle directory.
     #[arg(long, default_value = "models")]
     pub(crate) model_dir: PathBuf,
@@ -33,6 +43,9 @@ fn native_library() -> PathBuf {
 // Fixed, validated PP-OCRv6 medium deployment profile. These are model/runtime
 // settings, not independent server switches.
 pub(crate) struct Settings {
+    pub(crate) log_level: crate::observability::LogLevel,
+    pub(crate) diagnostics_dir: Option<PathBuf>,
+    pub(crate) diagnostics_max_mib: u32,
     pub(crate) lines_max_images: usize,
     pub(crate) lines_max_total_bytes: usize,
     pub(crate) lines_max_total_pixels: u64,
@@ -88,6 +101,9 @@ impl Settings {
     pub(crate) fn from_cli(cli: Cli) -> Self {
         let path = |name: &str| cli.model_dir.join(name).to_string_lossy().into_owned();
         Self {
+            log_level: cli.log_level,
+            diagnostics_dir: cli.diagnostics_dir.clone(),
+            diagnostics_max_mib: cli.diagnostics_max_mib,
             lines_max_images: 128,
             lines_max_total_bytes: cli.max_request_mib as usize * 1024 * 1024,
             lines_max_total_pixels: 16_000_000,

@@ -54,3 +54,7 @@ kept outside the public source project.
 An optional CPU glyph dictionary is packaged after the base model build with
 `tools/package_glyph_dictionary.py`; see [glyph recovery](glyph-fallback.md).
 The matcher reuses existing Rust dependencies. Font tooling is offline only.
+
+Structured logging and optional diagnostic storage use the Rust standard library
+and existing dependencies; no database or logging service is required. Case data
+belongs in a separate writable volume, not the model directory.

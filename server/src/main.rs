@@ -1,4 +1,7 @@
 mod config;
+mod diagnostics;
+mod observability;
+use observability::{emit, LogLevel, RequestContext};
 mod glyph_fallback;
 use config::{Cli, Settings};
 mod lines;
@@ -13,6 +16,7 @@ use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{Response, StatusCode};
 use axum::response::{IntoResponse, Json};
 use axum::routing::{get, post};
+use axum::Extension;
 use axum::Router;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
@@ -28,6 +32,7 @@ use tokio::time::timeout;
 
 #[derive(Clone)]
 struct AppState {
+    diagnostics: Arc<diagnostics::Diagnostics>,
     glyph_fallback: Option<Arc<glyph_fallback::Fallback>>,
     fallback_slots: Arc<Semaphore>,
     recognizer: Arc<Mutex<NativeRecognizer>>,
@@ -179,14 +184,36 @@ impl IntoResponse for ApiError {
             "error": self.message,
             "status": self.status.as_u16(),
         }));
-        (self.status, body).into_response()
+        let mut response = (self.status, body).into_response();
+        response
+            .extensions_mut()
+            .insert(observability::ErrorDetail(self.message));
+        response
     }
 }
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() {
+    match run().await {
+        Ok(()) => (),
+        Err(error) => {
+            emit(
+                LogLevel::Error,
+                "server_failed",
+                json!({"error":format!("{error:#}")}),
+            );
+            std::process::exit(1);
+        }
+    }
+}
+async fn run() -> anyhow::Result<()> {
     let args = Settings::from_cli(Cli::parse());
+    observability::init(args.log_level);
     validate_args(&args)?;
+    let diagnostics = Arc::new(diagnostics::Diagnostics::open(
+        args.diagnostics_dir.as_deref(),
+        u64::from(args.diagnostics_max_mib) * 1024 * 1024,
+    )?);
     let default_character_policy = CharacterPolicy::parse(&args.glyph_character_policy)
         .expect("glyph character policy was validated");
     let default_score_mode =
@@ -272,6 +299,7 @@ async fn main() -> anyhow::Result<()> {
     };
     let glyph_fallback = glyph_fallback::Fallback::load_optional(&args.glyph_dictionary)?;
     let state = AppState {
+        diagnostics: diagnostics.clone(),
         glyph_fallback: glyph_fallback.map(Arc::new),
         fallback_slots: Arc::new(Semaphore::new(1)),
         recognizer: Arc::new(Mutex::new(recognizer)),
@@ -331,31 +359,33 @@ async fn main() -> anyhow::Result<()> {
             post(ocr_recognize).options(options_ok),
         )
         .layer(DefaultBodyLimit::max(request_body_limit))
+        .layer(axum::middleware::from_fn(observability::request_log))
         .with_state(state);
 
     let addr = args.listen;
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    println!(
-        "{}",
-        json!({
-            "event": "startup", "listening": format!("http://{addr}"),
-            "glyph_recognize": format!("http://{addr}/v1/glyphs/recognize"),
-            "ocr_enabled": true,
-            "ocr_recognize": format!("http://{addr}/v1/ocr/recognize"),
-            "lines_enabled": true,
-            "lines_recognize": format!("http://{addr}/v1/lines/recognize"),
-        })
+    emit(
+        LogLevel::Info,
+        "startup",
+        json!({"listening":addr.to_string(),"version":env!("CARGO_PKG_VERSION"),
+        "diagnostics_enabled":diagnostics.enabled(),"diagnostics_max_mib":args.diagnostics_max_mib}),
     );
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
+    drop(diagnostics); // Drain queued cases after graceful HTTP shutdown.
+    emit(LogLevel::Info, "shutdown", json!({}));
     Ok(())
 }
 
 async fn shutdown_signal() {
     let ctrl_c = async {
         if let Err(err) = tokio::signal::ctrl_c().await {
-            eprintln!("failed to install Ctrl-C shutdown handler: {err}");
+            emit(
+                LogLevel::Error,
+                "signal_handler_failed",
+                json!({"signal":"SIGINT","error":err.to_string()}),
+            );
         }
     };
 
@@ -366,7 +396,11 @@ async fn shutdown_signal() {
                 signal.recv().await;
             }
             Err(err) => {
-                eprintln!("failed to install SIGTERM shutdown handler: {err}");
+                emit(
+                    LogLevel::Error,
+                    "signal_handler_failed",
+                    json!({"signal":"SIGTERM","error":err.to_string()}),
+                );
                 std::future::pending::<()>().await;
             }
         }
@@ -530,16 +564,18 @@ async fn ocr_info(State(state): State<AppState>) -> Result<Json<Value>, ApiError
 
 async fn recognize(
     State(state): State<AppState>,
+    Extension(context): Extension<RequestContext>,
     Json(payload): Json<RecognizeRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    let permit = timeout(state.queue_timeout, state.semaphore.clone().acquire_owned())
-        .await
+    let queued = Instant::now();
+    let permit = timeout(state.queue_timeout, state.semaphore.clone().acquire_owned()).await;
+    context.set("queue_ms", json!(queued.elapsed().as_secs_f64() * 1000.0));
+    let permit = permit
         .map_err(|_| ApiError::unavailable("recognition queue timeout"))?
         .map_err(|_| ApiError::unavailable("recognition worker is closed"))?;
-
     let state_for_blocking = state.clone();
     let value = tokio::task::spawn_blocking(move || {
-        recognize_blocking(state_for_blocking, payload, permit)
+        recognize_blocking(state_for_blocking, payload, permit, context)
     })
     .await
     .map_err(|err| ApiError::internal(format!("recognition task failed: {err}")))??;
@@ -549,17 +585,18 @@ async fn recognize(
 
 async fn ocr_recognize(
     State(state): State<AppState>,
+    Extension(context): Extension<RequestContext>,
     Json(payload): Json<OcrRecognizeRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    let permit = timeout(state.queue_timeout, state.semaphore.clone().acquire_owned())
-        .await
+    let queued = Instant::now();
+    let permit = timeout(state.queue_timeout, state.semaphore.clone().acquire_owned()).await;
+    context.set("queue_ms", json!(queued.elapsed().as_secs_f64() * 1000.0));
+    let permit = permit
         .map_err(|_| ApiError::unavailable("OCR queue timeout"))?
         .map_err(|_| ApiError::unavailable("OCR worker is closed"))?;
-
     let state_for_blocking = state.clone();
     let value = tokio::task::spawn_blocking(move || {
-        let _permit = permit;
-        ocr_recognize_blocking(state_for_blocking, payload)
+        ocr_recognize_blocking(state_for_blocking, payload, context, permit)
     })
     .await
     .map_err(|err| ApiError::internal(format!("OCR task failed: {err}")))??;
@@ -571,6 +608,7 @@ fn recognize_blocking(
     state: AppState,
     payload: RecognizeRequest,
     permit: tokio::sync::OwnedSemaphorePermit,
+    context: RequestContext,
 ) -> Result<Value, ApiError> {
     let request_started = Instant::now();
     let character_policy = match payload.character_policy.as_deref() {
@@ -658,12 +696,16 @@ fn recognize_blocking(
             }
         }
     }
+    state.diagnostics.observe(&context,"glyph",&image_values,&response,
+        json!({"width":width,"batch_size":batch_size,"character_policy":character_policy.as_str(),"score_mode":score_mode.as_str(),"return_timesteps":return_timesteps}));
     Ok(response)
 }
 
 fn ocr_recognize_blocking(
     state: AppState,
     payload: OcrRecognizeRequest,
+    context: RequestContext,
+    permit: tokio::sync::OwnedSemaphorePermit,
 ) -> Result<Value, ApiError> {
     if payload.image.is_empty() {
         return Err(ApiError::bad_request("'image' must not be empty"));
@@ -690,8 +732,13 @@ fn ocr_recognize_blocking(
             (preprocess.image.width() * 3) as i32,
         )
         .map_err(|err| ApiError::internal(err.to_string()))?;
+    drop(worker);
+    drop(permit);
     let blocking_ms = request_started.elapsed().as_secs_f64() * 1000.0;
     attach_ocr_rust_timings(&mut response, &preprocess, preprocess_ms, blocking_ms);
+    state
+        .diagnostics
+        .observe(&context, "page", &[payload.image], &response, json!({}));
     Ok(response)
 }
 

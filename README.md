@@ -27,7 +27,7 @@ build; the serving image contains the required runtime libraries and executable.
 Docker users can build with `docker build -f Containerfile` and use `--gpus all`
 in place of the Podman CDI device option.
 
-Only four application settings are exposed:
+Core inference settings:
 
 | Option | Default | Purpose |
 |---|---|---|
@@ -35,6 +35,10 @@ Only four application settings are exposed:
 | `--listen` | `127.0.0.1:8184` | Bind address; the container uses `0.0.0.0:8184` |
 | `--max-request-mib` | `16` | Image-data budget per request |
 | `--queue-timeout-ms` | `30000` | Time allowed waiting for an inference slot |
+
+Structured JSON logs go to stderr. Optional `--diagnostics-dir` captures empty
+and recovered inputs for replay, with `--diagnostics-max-mib` retention and
+`--log-level` verbosity. See [logging and storage](docs/logging.md).
 
 All three endpoint families are always available. Precision, shared memory,
 workspace sizing, model dimensions, batch capacities and detector thresholds
