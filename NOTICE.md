@@ -23,3 +23,9 @@ own licenses. The container assembles NVIDIA runtime libraries from NVIDIA's
 CUDA/cuDNN image; the project's MIT license does not relicense those libraries
 or model weights. Publishing this source repository and redistributing built
 GPU images/model bundles are separate distribution decisions.
+
+Optional glyph dictionaries contain font-derived templates. The dictionary
+packager preserves source font hashes/rendering metadata and copies supplied
+font license notices. Font files and generated template assets are not included
+in the source repository. The evaluated dictionary uses Noto CJK fonts; include
+the corresponding notices with any distributed dictionary.

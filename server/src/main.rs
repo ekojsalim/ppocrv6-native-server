@@ -1,4 +1,5 @@
 mod config;
+mod glyph_fallback;
 use config::{Cli, Settings};
 mod lines;
 mod native;
@@ -27,6 +28,8 @@ use tokio::time::timeout;
 
 #[derive(Clone)]
 struct AppState {
+    glyph_fallback: Option<Arc<glyph_fallback::Fallback>>,
+    fallback_slots: Arc<Semaphore>,
     recognizer: Arc<Mutex<NativeRecognizer>>,
     ocr: Arc<Mutex<NativeFullPage>>,
     lines: Arc<lines::LineWorker>,
@@ -267,7 +270,10 @@ async fn main() -> anyhow::Result<()> {
             &line_worker.recognizer.lock().unwrap(),
         )?))
     };
+    let glyph_fallback = glyph_fallback::Fallback::load_optional(&args.glyph_dictionary)?;
     let state = AppState {
+        glyph_fallback: glyph_fallback.map(Arc::new),
+        fallback_slots: Arc::new(Semaphore::new(1)),
         recognizer: Arc::new(Mutex::new(recognizer)),
         lines: Arc::new(line_worker),
         ocr,
@@ -485,6 +491,10 @@ async fn info(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
         );
         map.insert("model_score_type".to_string(), json!(model_score_type));
         map.insert(
+            "cpu_glyph_fallback".to_string(),
+            glyph_fallback::info(state.glyph_fallback.is_some()),
+        );
+        map.insert(
             "score_types_by_character_policy".to_string(),
             json!({
                 "cjk_focus": "conditional_probability",
@@ -529,8 +539,7 @@ async fn recognize(
 
     let state_for_blocking = state.clone();
     let value = tokio::task::spawn_blocking(move || {
-        let _permit = permit;
-        recognize_blocking(state_for_blocking, payload)
+        recognize_blocking(state_for_blocking, payload, permit)
     })
     .await
     .map_err(|err| ApiError::internal(format!("recognition task failed: {err}")))??;
@@ -558,7 +567,11 @@ async fn ocr_recognize(
     Ok(Json(value))
 }
 
-fn recognize_blocking(state: AppState, payload: RecognizeRequest) -> Result<Value, ApiError> {
+fn recognize_blocking(
+    state: AppState,
+    payload: RecognizeRequest,
+    permit: tokio::sync::OwnedSemaphorePermit,
+) -> Result<Value, ApiError> {
     let request_started = Instant::now();
     let character_policy = match payload.character_policy.as_deref() {
         Some(value) => CharacterPolicy::parse(value).ok_or_else(|| {
@@ -615,6 +628,21 @@ fn recognize_blocking(state: AppState, payload: RecognizeRequest) -> Result<Valu
             score_mode as i32,
         )
         .map_err(|err| ApiError::internal(err.to_string()))?;
+    drop(recognizer);
+    drop(permit);
+    if let Some(fallback) = &state.glyph_fallback {
+        let slot = state.fallback_slots.clone().try_acquire_owned().ok();
+        fallback.apply(
+            &mut response,
+            &image_values,
+            slot.is_some(),
+            matches!(score_mode, ScoreMode::Accepted),
+            |value| {
+                let raw = decode_base64_image(value, state.limits.max_image_bytes)?;
+                decode_image(&raw, state.limits.max_image_pixels).map(DynamicImage::ImageRgb8)
+            },
+        )?;
+    }
     let blocking_ms = request_started.elapsed().as_secs_f64() * 1000.0;
     attach_rust_timings(&mut response, &preprocess.stats, preprocess_ms, blocking_ms);
 

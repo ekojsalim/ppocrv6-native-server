@@ -89,6 +89,20 @@ To reuse already prepared source assets, pass their directory as the second
 argument to `tools/build_models.sh`. A completed output directory is never
 silently overwritten. [Build details](docs/build.md) describe layout and tests.
 
+## Optional CPU glyph recovery
+
+A versioned dictionary in `models/glyph-fallback/dictionary.json` enables
+Rust-side recovery of empty glyph results. It preserves nonempty predictions,
+uses bounded CPU work and requires no additional VRAM or server flags.
+See [packaging and response semantics](docs/glyph-fallback.md), including nullable
+scores for template recoveries in `model` score mode.
+
+The [offline evaluation](docs/cpu-glyph-fallback-v2.md),
+[CPU measurements](docs/cpu-glyph-fallback-performance.md), and
+[failure cohorts](docs/glyph-fallback-failures.md) document the evidence and
+limitations. The [GPU experiment](docs/glyph-fallback-gpu.md) remains separate
+from serving. Experimental assets and corpora remain outside Git.
+
 ## License
 
 Project code: MIT. Dependencies and model weights have separate licenses;

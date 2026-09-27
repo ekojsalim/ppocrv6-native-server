@@ -50,3 +50,7 @@ path and set `CUBLAS_WORKSPACE_CONFIG=:16:8` as the container does.
 
 Model binaries, corpora, profiling traces and historical tuning programs are
 kept outside the public source project.
+
+An optional CPU glyph dictionary is packaged after the base model build with
+`tools/package_glyph_dictionary.py`; see [glyph recovery](glyph-fallback.md).
+The matcher reuses existing Rust dependencies. Font tooling is offline only.
