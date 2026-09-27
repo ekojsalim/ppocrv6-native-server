@@ -35,3 +35,6 @@ An optional [CPU glyph fallback](glyph-fallback.md) handles empty isolated-glyph
 results when a dictionary is installed. Recovered predictions expose provenance
 and original model output; `score` is nullable in `model` mode, and CTC class IDs
 are not synthesized. The `/info` endpoint reports activation and fixed limits.
+
+All HTTP responses include a generated `X-Request-ID`, also present in structured
+request logs and any saved [diagnostic cases](logging.md).

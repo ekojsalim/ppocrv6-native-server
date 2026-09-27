@@ -7,3 +7,4 @@ tmp
 server/target
 native/build
 **/__pycache__
+diagnostics
