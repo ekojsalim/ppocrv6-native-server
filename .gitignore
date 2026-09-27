@@ -1,0 +1,10 @@
+/build/
+/models*/
+/artifacts/
+/tmp/
+/.venv*/
+**/__pycache__/
+/server/target/
+/native/build/
+*.nsys-rep
+*.sqlite

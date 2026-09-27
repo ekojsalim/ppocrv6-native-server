@@ -1,0 +1,9 @@
+.git
+artifacts
+models*
+build
+tmp
+.venv*
+server/target
+native/build
+**/__pycache__
